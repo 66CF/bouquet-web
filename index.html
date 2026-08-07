@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Particle Bouquet</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌷</text></svg>" />
+  <link rel="stylesheet" href="./css/style.css" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "./vendor/three/three.module.js",
+      "three/addons/": "./vendor/three/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+
+  <!-- 场景容器 -->
+  <div id="app">
+    <!-- 弥散光氛围背景 -->
+    <div class="bg-glow" aria-hidden="true">
+      <div class="glow glow-1"></div>
+      <div class="glow glow-2"></div>
+      <div class="glow glow-3"></div>
+      <div class="glow glow-4"></div>
+      <div class="glow glow-5"></div>
+    </div>
+
+    <canvas id="scene"></canvas>
+
+    <!-- 底部控制栏 -->
+    <nav class="controls" id="controls">
+      <div class="ctrl-slider" id="ctrlSlider"></div>
+      <button class="ctrl-btn" data-action="original" title="展示原始模型">flower</button>
+      <button class="ctrl-btn" data-action="particles" title="模型粒子化，粒子保持花束结构">cloud</button>
+      <button class="ctrl-btn" data-action="explode" title="粒子从花束结构向外爆炸">散</button>
+      <button class="ctrl-btn" data-action="aggregate" title="粒子聚合回花束结构">聚</button>
+      <button class="ctrl-btn" data-action="text" title="粒子云汇聚拼成字母 ZWC">YOU</button>
+      <button class="ctrl-btn" data-action="cycle" title="粒子化 → 爆炸 → 聚合 → 还原 自动循环">auto</button>
+    </nav>
+
+    <!-- 设置面板 -->
+    <aside class="settings" id="settings">
+      <button class="settings-toggle" id="settingsToggle" aria-label="设置">⚙</button>
+      <div class="settings-body" id="settingsBody">
+        <div class="setting-row">
+          <label for="particleCount">粒子数量</label>
+          <input type="range" id="particleCount" min="20000" max="285000" step="5000" value="140000" />
+          <span class="value" id="particleCountVal">14万</span>
+        </div>
+        <div class="setting-row">
+          <label for="particleSize">粒子大小</label>
+          <input type="range" id="particleSize" min="0.4" max="3.2" step="0.05" value="1.0" />
+          <span class="value" id="particleSizeVal">1.0</span>
+        </div>
+        <div class="setting-row">
+          <label for="explodeDist">爆炸距离</label>
+          <input type="range" id="explodeDist" min="0.5" max="4" step="0.1" value="2.2" />
+          <span class="value" id="explodeDistVal">2.2</span>
+        </div>
+        <div class="setting-row">
+          <label for="bloomStrength">发光强度</label>
+          <input type="range" id="bloomStrength" min="0" max="1.5" step="0.05" value="0.05" />
+          <span class="value" id="bloomStrengthVal">0.05</span>
+        </div>
+        <div class="setting-row">
+          <label for="autoRotate" class="checkbox-label"><input type="checkbox" id="autoRotate" checked /> 自动旋转</label>
+        </div>
+        <div class="stat-row">
+          <span id="statCount">粒子 0</span>
+          <span id="statVerts">顶点 0</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- 操作提示 -->
+    <div class="hint">拖拽旋转 · 滚轮缩放 · 触屏可手势操作</div>
+
+    <!-- 加载遮罩 -->
+    <div class="loading" id="loading">
+      <div class="loading-inner">
+        <div class="loading-heart">✦</div>
+        <div class="loading-title">正在准备花束</div>
+        <div class="loading-bar"><div class="loading-bar-fill" id="loadingFill"></div></div>
+        <div class="loading-text" id="loadingText">加载模型中…</div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="./js/main.js"></script>
+</body>
+</html>
