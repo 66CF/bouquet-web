@@ -30,6 +30,13 @@
 
     <canvas id="scene"></canvas>
 
+    <!-- 写字模式的空间辉光 / 扫描环（粒子仍由 WebGL 绘制） -->
+    <div class="writing-aura" id="writingAura" aria-hidden="true">
+      <div class="writing-orbit orbit-1"></div>
+      <div class="writing-orbit orbit-2"></div>
+      <div class="writing-scan"></div>
+    </div>
+
     <!-- 底部控制栏 -->
     <nav class="controls" id="controls">
       <div class="ctrl-slider" id="ctrlSlider"></div>

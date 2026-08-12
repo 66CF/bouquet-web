@@ -150,12 +150,16 @@ const particleVertexShader = /* glsl */ `
   attribute vec3 aColor;
   attribute float aRand;
   attribute float aSize;
+  attribute float aTextPhase;
 
   uniform float uTime;
   uniform float uSpread;
   uniform float uSpreadMode;
   uniform float uSpreadDist;
   uniform float uMorph;
+  uniform float uWriting;
+  uniform float uTextMode;
+  uniform float uTextPulse;
   uniform float uParticleOpacity;
   uniform float uPixelRatio;
   uniform float uSizeScale;
@@ -166,6 +170,7 @@ const particleVertexShader = /* glsl */ `
 
   varying vec3 vColor;
   varying float vAlpha;
+  varying float vInkGlow;
 
   void main() {
     float r1 = fract(aRand * 7.13);
@@ -181,8 +186,31 @@ const particleVertexShader = /* glsl */ `
       uCameraRight * aText.x +
       uCameraUp * aText.y +
       uCameraBack * aText.z;
-    vec3 base = mix(aHome, textBase, uMorph);
-    vec3 pos = base + dir * dist * e;
+    // 写字模式：粒子不是同时“贴”到文字上，而是沿着左→右的笔锋依次落位。
+    // 尚未落笔的粒子围绕文字旋转成能量丝带，笔锋经过时收束到字形。
+    float phase = clamp(aTextPhase, 0.0, 1.0);
+    float ink = smoothstep(phase * 0.82, phase * 0.82 + 0.18, uWriting);
+    float textMorph = uMorph * mix(1.0, ink, uTextMode);
+    vec3 base = mix(aHome, textBase, textMorph);
+
+    float lead = 1.0 - smoothstep(0.035, 0.13, abs(uWriting - phase));
+    // 笔锋抵达末端后立即熄灭，避免最右侧粒子永久处于高亮状态。
+    lead *= 1.0 - smoothstep(0.94, 1.0, uWriting);
+    float angle = aRand * 18.8496 + uTime * (1.6 + r1);
+    float ribbon = uTextMode * uMorph * (1.0 - ink);
+    float ribbonRadius = (0.16 + 0.48 * r2) * ribbon;
+    vec3 ribbonOffset =
+      uCameraUp * sin(angle) * ribbonRadius +
+      uCameraBack * cos(angle) * ribbonRadius +
+      uCameraRight * (0.18 * sin(angle * 0.37));
+
+    // 完成落款时从文字中心向外弹出一圈细微冲击波。
+    float pulse = sin(clamp(uTextPulse, 0.0, 1.0) * 3.14159);
+    vec2 textDir = normalize(aText.xy + vec2(0.0001));
+    vec3 pulseOffset = (uCameraRight * textDir.x + uCameraUp * textDir.y)
+      * pulse * (0.08 + 0.16 * r1) * uTextMode;
+
+    vec3 pos = base + dir * dist * e + ribbonOffset + pulseOffset;
 
     // 轻微漂浮，让云层有呼吸感
     pos.x += sin(uTime * 0.6 + aRand * 6.2831) * 0.004;
@@ -195,11 +223,17 @@ const particleVertexShader = /* glsl */ `
     float twinkle = 0.70 + 0.30 * sin(uTime * (1.0 + r1 * 3.0) + r2 * 6.2831);
     // 聚合状态降低叠加亮度，散开后再补偿透明度，保留花瓣颜色层次。
     float densityCompensation = mix(0.58, 0.85, uSpread);
-    vAlpha = uParticleOpacity * twinkle * densityCompensation;
-    vColor = aColor;
+    vInkGlow = max(lead * uTextMode, pulse * 0.55 * uTextMode);
+    // 十几万粒子压进字形后需要显著降低单点能量，否则加色混合会把镂空笔画淹没。
+    float textDensity = mix(1.0, 0.30 + 0.42 * vInkGlow, uTextMode * ink);
+    vAlpha = uParticleOpacity * mix(twinkle * densityCompensation, 1.0, vInkGlow * 0.82) * textDensity;
+    // 笔锋是冰蓝色，落笔瞬间转为粉紫高光，再回到花束原色。
+    vec3 inkColor = mix(vec3(0.22, 0.82, 1.0), vec3(1.0, 0.28, 0.78), r1);
+    vColor = mix(aColor, inkColor, vInkGlow * 0.82);
 
     // 爆炸/散射过程中粒子略微放大，保证散开后仍有光点存在感
-    float size = aSize * uSizeScale * (1.0 + 0.8 * uSpread);
+    float settledScale = mix(1.0, 0.52, uTextMode * ink);
+    float size = aSize * uSizeScale * (1.0 + 0.8 * uSpread + 1.8 * vInkGlow) * settledScale;
     gl_PointSize = size * uPixelRatio * uScaleFactor / max(0.1, -mv.z);
     gl_PointSize = clamp(gl_PointSize, 1.0, 24.0);
   }
@@ -208,13 +242,15 @@ const particleVertexShader = /* glsl */ `
 const particleFragmentShader = /* glsl */ `
   varying vec3 vColor;
   varying float vAlpha;
+  varying float vInkGlow;
 
   void main() {
     vec2 uv = gl_PointCoord - 0.5;
     float d = length(uv) * 2.0;
     float a = smoothstep(1.0, 0.0, d);
     a = a * a;                    // 柔和光斑
-    vec3 col = vColor * (0.8 + 0.45 * a);  // 中心微亮，整体柔和
+    float core = smoothstep(0.42, 0.0, d);
+    vec3 col = vColor * (0.8 + 0.45 * a + 1.35 * core * vInkGlow);
     gl_FragColor = vec4(col * a * vAlpha, a * vAlpha);
   }
 `;
@@ -228,6 +264,9 @@ const particleMaterial = new THREE.ShaderMaterial({
     uSpreadMode: { value: 0 },
     uSpreadDist: { value: 2.2 },
     uMorph: { value: 0 },
+    uWriting: { value: 0 },
+    uTextMode: { value: 0 },
+    uTextPulse: { value: 0 },
     uParticleOpacity: { value: 0 },
     uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) },
     uSizeScale: { value: 1.0 },
@@ -253,6 +292,9 @@ const state = {
   particleOpacity: 0,
   spread: 0,
   morph: 0, // 0 = 花束形状，1 = 字母 ZWC 形状
+  writing: 0, // 0..1 = 写字笔锋的横向进度
+  textMode: 0,
+  textPulse: 0,
   spreadMode: 0, // 0 = 爆炸方向（径向），1 = 散射（随机方向）
 };
 
@@ -272,6 +314,7 @@ const full = {
   randDir: null,
   rand: null,
   size: null,
+  textPhase: null,
 };
 
 const textureCache = new Map();
@@ -433,7 +476,7 @@ function sampleModelSurface(root, count) {
   return { positions, colors };
 }
 
-/* 用 Canvas 把 "zwc" 渲染成点阵，生成粒子拼字的目标位置 */
+/* 用 Canvas 把 "Z W C" 渲染成点阵，生成粒子拼字的目标位置 */
 function buildTextTargets(count) {
   const W = 900;
   const H = 320;
@@ -441,11 +484,16 @@ function buildTextTargets(count) {
   canvas.width = W;
   canvas.height = H;
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  ctx.fillStyle = '#fff';
-  ctx.font = 'bold 250px Arial, "PingFang SC", "Microsoft YaHei", sans-serif';
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 22;
+  ctx.lineJoin = 'round';
+  ctx.font = '900 210px Arial, "PingFang SC", "Microsoft YaHei", sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText('zwc', W / 2, H / 2);
+  // 独立描边字母比实心连写更适合高密度粒子：留白清晰，也更像霓虹落款。
+  ctx.strokeText('Z', 190, H / 2);
+  ctx.strokeText('W', 450, H / 2);
+  ctx.strokeText('C', 710, H / 2);
   const data = ctx.getImageData(0, 0, W, H).data;
 
   const pts = [];
@@ -531,10 +579,11 @@ function onModelLoaded(gltf) {
   full.randDir = new Float32Array(totalVerts * 3);
   full.rand = new Float32Array(totalVerts);
   full.size = new Float32Array(totalVerts);
+  full.textPhase = new Float32Array(totalVerts);
   full.text = new Float32Array(totalVerts * 3);
 
   const centerY = center.y;
-  // 字母 "zwc" 的目标点阵（相对模型尺寸缩放）
+  // 字母 "Z W C" 的目标点阵（相对模型尺寸缩放）
   const textTargets = buildTextTargets(totalVerts);
   const textScale = size.length() * 0.55;
   for (let i = 0; i < totalVerts; i++) {
@@ -588,6 +637,8 @@ function onModelLoaded(gltf) {
       full.text[i3] = textTargets[i3] * textScale;
       full.text[i3 + 1] = textTargets[i3 + 1] * textScale;
       full.text[i3 + 2] = textTargets[i3 + 2] * textScale;
+      // 以横向位置为主，混入少量纵向与随机差异，形成有机笔锋而非直线擦除。
+      full.textPhase[i] = clamp01(textTargets[i3] + 0.5 + textTargets[i3 + 1] * 0.08 + (r2 - 0.5) * 0.045);
     }
   }
 
@@ -602,6 +653,7 @@ function onModelLoaded(gltf) {
   particleGeo.setAttribute('aRandDir', new THREE.BufferAttribute(full.randDir, 3));
   particleGeo.setAttribute('aRand', new THREE.BufferAttribute(full.rand, 1));
   particleGeo.setAttribute('aSize', new THREE.BufferAttribute(full.size, 1));
+  particleGeo.setAttribute('aTextPhase', new THREE.BufferAttribute(full.textPhase, 1));
   particleSystem = new THREE.Points(particleGeo, particleMaterial);
   particleSystem.frustumCulled = false;
   scene.add(particleSystem);
@@ -671,6 +723,23 @@ function clearPending() {
   actionTimeout = null;
 }
 
+function setWritingAura(active, replay = false) {
+  const aura = $('writingAura');
+  if (!aura) return;
+  if (replay) {
+    aura.classList.remove('active');
+    // 强制刷新动画时间线，连续点击“写字”也会从头播放。
+    void aura.offsetWidth;
+  }
+  aura.classList.toggle('active', active);
+}
+
+function leaveTextMode() {
+  setWritingAura(false);
+  state.textMode = 0;
+  state.textPulse = 0;
+}
+
 function ensureParticlesVisible(quick = false) {
   const dur = quick ? 0.55 : 1.2;
   tween(state, 'meshOpacity', 0, dur);
@@ -681,6 +750,7 @@ function ensureParticlesVisible(quick = false) {
 const actions = {
   original() {
     clearPending();
+    leaveTextMode();
     tween(state, 'meshOpacity', 1, 1.1);
     tween(state, 'particleOpacity', 0, 1.1);
     tween(state, 'spread', 0, 1.1);
@@ -689,6 +759,7 @@ const actions = {
   },
   particles() {
     clearPending();
+    leaveTextMode();
     state.spreadMode = 0;
     tween(state, 'spread', 0, 1.2);
     tween(state, 'morph', 0, 1.4);
@@ -697,21 +768,22 @@ const actions = {
   text() {
     clearPending();
     state.spreadMode = 1;
+    state.textMode = 1;
+    state.textPulse = 0;
+    state.writing = 0;
+    setWritingAura(true, true);
     const go = () => {
-      if (state.morph < 0.5) {
-        // 从花束形状出发：先散成云 → 渐变到字母 → 聚合拼字
-        tween(state, 'spread', 1, 1.0, EASE.inOutSine, () => {
-          tween(state, 'morph', 1, 1.8, EASE.inOutCubic, () => {
-            tween(state, 'spread', 0, 1.8, EASE.inOutCubic);
+      // 第一幕：花束坍缩为旋转星尘；第二幕：笔锋从左向右“吸附”粒子；
+      // 第三幕：落款冲击波让完整字形短暂扩张并提亮。
+      tween(state, 'spread', 0.62, 0.82, EASE.outCubic, () => {
+        state.morph = 1;
+        tween(state, 'spread', 0.02, 2.65, EASE.inOutCubic);
+        tween(state, 'writing', 1, 2.45, EASE.inOutSine, () => {
+          tween(state, 'textPulse', 1, 0.72, EASE.outCubic, () => {
+            state.textPulse = 0;
           });
         });
-      } else {
-        // 已经或接近字母形状：补全 morph，再散开重聚。
-        tween(state, 'spread', 1, 1.0, EASE.inOutSine, () => {
-          tween(state, 'morph', 1, 0.8, EASE.inOutCubic);
-          tween(state, 'spread', 0, 1.8, EASE.inOutCubic);
-        });
-      }
+      });
     };
     if (state.particleOpacity < 0.98 || state.meshOpacity > 0.02) {
       ensureParticlesVisible(true);
@@ -722,6 +794,7 @@ const actions = {
   },
   explode() {
     clearPending();
+    leaveTextMode();
     state.spreadMode = 0;
     tween(state, 'morph', 0, 1.1);
     if (state.particleOpacity < 0.98 || state.meshOpacity > 0.02) {
@@ -735,6 +808,7 @@ const actions = {
   },
   scatter() {
     clearPending();
+    leaveTextMode();
     state.spreadMode = 1;
     if (state.particleOpacity < 0.98 || state.meshOpacity > 0.02) {
       ensureParticlesVisible(true);
@@ -747,6 +821,7 @@ const actions = {
   },
   aggregate() {
     clearPending();
+    leaveTextMode();
     ensureParticlesVisible(true);
     tween(state, 'spread', 0, 2.2, EASE.inOutCubic);
     tween(state, 'morph', 0, 2.2, EASE.inOutCubic);
@@ -771,6 +846,7 @@ const CYCLE = [
 
 function actionCycle() {
   clearPending();
+  leaveTextMode();
   cycling = true;
   cycleStep(0);
 }
@@ -800,6 +876,9 @@ function updateFrame(dt, elapsed) {
   u.uSpreadDist.value =
     parseFloat($('explodeDist').value) * (state.spreadMode === 0 ? 1 : 0.6);
   u.uMorph.value = state.morph;
+  u.uWriting.value = state.writing;
+  u.uTextMode.value = state.textMode;
+  u.uTextPulse.value = state.textPulse;
   u.uParticleOpacity.value = state.particleOpacity;
   u.uSizeScale.value = parseFloat($('particleSize').value);
   u.uCameraRight.value.setFromMatrixColumn(camera.matrixWorld, 0);
