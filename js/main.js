@@ -160,6 +160,9 @@ const particleVertexShader = /* glsl */ `
   uniform float uPixelRatio;
   uniform float uSizeScale;
   uniform float uScaleFactor;
+  uniform vec3 uCameraRight;
+  uniform vec3 uCameraUp;
+  uniform vec3 uCameraBack;
 
   varying vec3 vColor;
   varying float vAlpha;
@@ -173,8 +176,12 @@ const particleVertexShader = /* glsl */ `
     float e = smoothstep(delay, 1.0, uSpread);
     vec3 dir = mix(aRadial, aRandDir, step(0.5, uSpreadMode));
     float dist = uSpreadDist * (0.25 + 0.75 * r2) * (1.0 - 0.25 * uSpreadMode);
-    // 花束形状 与 字母形状 之间渐变
-    vec3 base = mix(aHome, aText, uMorph);
+    // 文字始终使用相机朝向的基向量，旋转场景后也不会镜像或变窄。
+    vec3 textBase =
+      uCameraRight * aText.x +
+      uCameraUp * aText.y +
+      uCameraBack * aText.z;
+    vec3 base = mix(aHome, textBase, uMorph);
     vec3 pos = base + dir * dist * e;
 
     // 轻微漂浮，让云层有呼吸感
@@ -186,7 +193,9 @@ const particleVertexShader = /* glsl */ `
     gl_Position = projectionMatrix * mv;
 
     float twinkle = 0.70 + 0.30 * sin(uTime * (1.0 + r1 * 3.0) + r2 * 6.2831);
-    vAlpha = uParticleOpacity * twinkle;
+    // 聚合状态降低叠加亮度，散开后再补偿透明度，保留花瓣颜色层次。
+    float densityCompensation = mix(0.58, 0.85, uSpread);
+    vAlpha = uParticleOpacity * twinkle * densityCompensation;
     vColor = aColor;
 
     // 爆炸/散射过程中粒子略微放大，保证散开后仍有光点存在感
@@ -223,8 +232,12 @@ const particleMaterial = new THREE.ShaderMaterial({
     uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) },
     uSizeScale: { value: 1.0 },
     uScaleFactor: { value: 1000 },
+    uCameraRight: { value: new THREE.Vector3(1, 0, 0) },
+    uCameraUp: { value: new THREE.Vector3(0, 1, 0) },
+    uCameraBack: { value: new THREE.Vector3(0, 0, 1) },
   },
   transparent: true,
+  premultipliedAlpha: true,
   depthWrite: false,
   blending: THREE.AdditiveBlending,
 });
@@ -264,35 +277,160 @@ const full = {
 const textureCache = new Map();
 const tmpVec = new THREE.Vector3();
 const tmpVec2 = new THREE.Vector3();
-const tmpUv = new THREE.Vector2();
+const tmpVec3 = new THREE.Vector3();
 
 function getTextureData(texture) {
   if (textureCache.has(texture.uuid)) return textureCache.get(texture.uuid);
   const img = texture.image;
   if (!img || !img.width) return null;
+  const maxSampleSize = 256;
+  const scale = Math.min(1, maxSampleSize / Math.max(img.width, img.height));
   const c = document.createElement('canvas');
-  c.width = img.width;
-  c.height = img.height;
+  c.width = Math.max(1, Math.round(img.width * scale));
+  c.height = Math.max(1, Math.round(img.height * scale));
   const ctx = c.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(img, 0, 0);
+  ctx.drawImage(img, 0, 0, c.width, c.height);
   const data = ctx.getImageData(0, 0, c.width, c.height).data;
   const td = { data, w: c.width, h: c.height };
   textureCache.set(texture.uuid, td);
   return td;
 }
 
-function sampleColor(texture, u, v, fallback) {
-  if (!texture) return fallback;
+function sampleColorInto(texture, u, v, fallback, target, offset) {
+  if (!texture) {
+    target[offset] = fallback[0];
+    target[offset + 1] = fallback[1];
+    target[offset + 2] = fallback[2];
+    return;
+  }
   const td = getTextureData(texture);
-  if (!td) return fallback;
+  if (!td) {
+    target[offset] = fallback[0];
+    target[offset + 1] = fallback[1];
+    target[offset + 2] = fallback[2];
+    return;
+  }
   const x = Math.floor((((u % 1) + 1) % 1) * (td.w - 1));
   const y = Math.floor((((v % 1) + 1) % 1) * (td.h - 1));
   const i = (y * td.w + x) * 4;
-  return [
-    srgbToLinear(td.data[i] / 255),
-    srgbToLinear(td.data[i + 1] / 255),
-    srgbToLinear(td.data[i + 2] / 255),
-  ];
+  target[offset] = srgbToLinear(td.data[i] / 255) * fallback[0];
+  target[offset + 1] = srgbToLinear(td.data[i + 1] / 255) * fallback[1];
+  target[offset + 2] = srgbToLinear(td.data[i + 2] / 255) * fallback[2];
+}
+
+function lowerBound(values, target) {
+  let lo = 0;
+  let hi = values.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (values[mid] < target) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/* 按三角形世界空间面积采样，避免粒子密度跟随模型拓扑密度。 */
+function sampleModelSurface(root, count) {
+  const meshes = [];
+  let totalArea = 0;
+
+  root.traverse((obj) => {
+    if (!obj.isMesh || obj.isInstancedMesh) return;
+    const geo = obj.geometry;
+    const posAttr = geo.attributes.position;
+    if (!posAttr) return;
+
+    const indexAttr = geo.index;
+    const triCount = Math.floor((indexAttr ? indexAttr.count : posAttr.count) / 3);
+    if (!triCount) return;
+
+    const uvAttr = geo.attributes.uv;
+    const material = Array.isArray(obj.material) ? obj.material[0] : obj.material;
+    const map = material && material.map ? material.map : null;
+    const fallbackColor = material && material.color
+      ? [material.color.r, material.color.g, material.color.b]
+      : [0.9, 0.85, 0.95];
+
+    if (material && !modelMaterials.includes(material)) modelMaterials.push(material);
+
+    obj.updateWorldMatrix(true, false);
+    const matrixWorld = obj.matrixWorld.clone();
+    const cumulativeAreas = new Float64Array(triCount);
+    let meshArea = 0;
+
+    for (let tri = 0; tri < triCount; tri++) {
+      const base = tri * 3;
+      const ia = indexAttr ? indexAttr.getX(base) : base;
+      const ib = indexAttr ? indexAttr.getX(base + 1) : base + 1;
+      const ic = indexAttr ? indexAttr.getX(base + 2) : base + 2;
+
+      tmpVec.fromBufferAttribute(posAttr, ia).applyMatrix4(matrixWorld);
+      tmpVec2.fromBufferAttribute(posAttr, ib).applyMatrix4(matrixWorld);
+      tmpVec3.fromBufferAttribute(posAttr, ic).applyMatrix4(matrixWorld);
+      tmpVec2.sub(tmpVec);
+      tmpVec3.sub(tmpVec);
+      meshArea += tmpVec2.cross(tmpVec3).length() * 0.5;
+      cumulativeAreas[tri] = meshArea;
+    }
+
+    if (meshArea <= 1e-12) return;
+    totalArea += meshArea;
+    meshes.push({
+      posAttr,
+      uvAttr,
+      indexAttr,
+      matrixWorld,
+      map,
+      fallbackColor,
+      cumulativeAreas,
+      areaStart: totalArea - meshArea,
+      areaEnd: totalArea,
+    });
+  });
+
+  if (!meshes.length || totalArea <= 0) return null;
+
+  const meshEnds = Float64Array.from(meshes, (mesh) => mesh.areaEnd);
+  const positions = new Float32Array(count * 3);
+  const colors = new Float32Array(count * 3);
+  const rand = mulberry32(20260809);
+
+  for (let i = 0; i < count; i++) {
+    const mesh = meshes[lowerBound(meshEnds, rand() * totalArea)];
+    const localArea = rand() * (mesh.areaEnd - mesh.areaStart);
+    const tri = lowerBound(mesh.cumulativeAreas, localArea);
+    const base = tri * 3;
+    const ia = mesh.indexAttr ? mesh.indexAttr.getX(base) : base;
+    const ib = mesh.indexAttr ? mesh.indexAttr.getX(base + 1) : base + 1;
+    const ic = mesh.indexAttr ? mesh.indexAttr.getX(base + 2) : base + 2;
+
+    // sqrt 分布可在三角形内得到均匀的面积采样。
+    const rootR = Math.sqrt(rand());
+    const r = rand();
+    const wa = 1 - rootR;
+    const wb = rootR * (1 - r);
+    const wc = rootR * r;
+    const i3 = i * 3;
+
+    tmpVec.fromBufferAttribute(mesh.posAttr, ia).multiplyScalar(wa);
+    tmpVec2.fromBufferAttribute(mesh.posAttr, ib).multiplyScalar(wb);
+    tmpVec3.fromBufferAttribute(mesh.posAttr, ic).multiplyScalar(wc);
+    tmpVec.add(tmpVec2).add(tmpVec3).applyMatrix4(mesh.matrixWorld);
+    positions[i3] = tmpVec.x;
+    positions[i3 + 1] = tmpVec.y;
+    positions[i3 + 2] = tmpVec.z;
+
+    if (mesh.uvAttr) {
+      const u = mesh.uvAttr.getX(ia) * wa + mesh.uvAttr.getX(ib) * wb + mesh.uvAttr.getX(ic) * wc;
+      const v = mesh.uvAttr.getY(ia) * wa + mesh.uvAttr.getY(ib) * wb + mesh.uvAttr.getY(ic) * wc;
+      sampleColorInto(mesh.map, u, v, mesh.fallbackColor, colors, i3);
+    } else {
+      sampleColorInto(null, 0, 0, mesh.fallbackColor, colors, i3);
+    }
+  }
+
+  textureCache.clear();
+  return { positions, colors };
 }
 
 /* 用 Canvas 把 "zwc" 渲染成点阵，生成粒子拼字的目标位置 */
@@ -361,52 +499,26 @@ function onModelLoaded(gltf) {
   scene.add(modelRoot);
   modelRoot.updateMatrixWorld(true);
 
-  // 第一遍：把每个网格的顶点变换到世界空间，记录位置 / 颜色 / 随机量
-  const positions = [];
-  const colors = [];
-  const randoms = [];
-  const sizes = [];
-  const bbox = new THREE.Box3();
+  const bbox = new THREE.Box3().setFromObject(modelRoot);
 
   modelRoot.traverse((obj) => {
     if (!obj.isMesh || obj.isInstancedMesh) return;
-    const geo = obj.geometry;
-    const posAttr = geo.attributes.position;
-    if (!posAttr) return;
-    const uvAttr = geo.attributes.uv;
-    const count = posAttr.count;
-
-    const material = Array.isArray(obj.material) ? obj.material[0] : obj.material;
-    const map = material && material.map ? material.map : null;
-    const fallbackColor = material && material.color
-      ? [material.color.r, material.color.g, material.color.b]
-      : [0.9, 0.85, 0.95];
-
-    if (material && !modelMaterials.includes(material)) modelMaterials.push(material);
-
-    obj.updateWorldMatrix(true, false);
-    const m = obj.matrixWorld;
-
-    for (let i = 0; i < count; i++) {
-      tmpVec.fromBufferAttribute(posAttr, i).applyMatrix4(m);
-      positions.push(tmpVec.x, tmpVec.y, tmpVec.z);
-      bbox.expandByPoint(tmpVec);
-
-      if (uvAttr) {
-        tmpUv.fromBufferAttribute(uvAttr, i);
-      } else {
-        tmpUv.set(0, 0);
-      }
-      const [r, g, b] = sampleColor(map, tmpUv.x, tmpUv.y, fallbackColor);
-      colors.push(r, g, b);
-    }
+    const posAttr = obj.geometry.attributes.position;
+    if (posAttr) totalVerts += posAttr.count;
   });
 
-  totalVerts = positions.length / 3;
   if (totalVerts === 0) {
     showLoadError('模型中未找到可渲染的网格');
     return;
   }
+
+  $('loadingText').textContent = '正在生成粒子表面…';
+  const sampled = sampleModelSurface(modelRoot, totalVerts);
+  if (!sampled) {
+    showLoadError('无法从模型表面生成粒子');
+    return;
+  }
+  const { positions, colors } = sampled;
 
   // 把模型居中到原点，粒子坐标同样减去中心
   const center = bbox.getCenter(new THREE.Vector3());
@@ -481,6 +593,15 @@ function onModelLoaded(gltf) {
 
   // 粒子系统
   particleGeo = new THREE.BufferGeometry();
+  const homeAttr = new THREE.BufferAttribute(full.home, 3);
+  particleGeo.setAttribute('position', homeAttr);
+  particleGeo.setAttribute('aHome', homeAttr);
+  particleGeo.setAttribute('aText', new THREE.BufferAttribute(full.text, 3));
+  particleGeo.setAttribute('aColor', new THREE.BufferAttribute(full.color, 3));
+  particleGeo.setAttribute('aRadial', new THREE.BufferAttribute(full.radial, 3));
+  particleGeo.setAttribute('aRandDir', new THREE.BufferAttribute(full.randDir, 3));
+  particleGeo.setAttribute('aRand', new THREE.BufferAttribute(full.rand, 1));
+  particleGeo.setAttribute('aSize', new THREE.BufferAttribute(full.size, 1));
   particleSystem = new THREE.Points(particleGeo, particleMaterial);
   particleSystem.frustumCulled = false;
   scene.add(particleSystem);
@@ -520,49 +641,9 @@ function prepareMaterials() {
 
 function applyParticleCount(targetCount) {
   if (!particleGeo || !full.home) return;
-  const stride = Math.max(1, Math.round(totalVerts / targetCount));
-  const n = Math.floor(totalVerts / stride);
+  const n = Math.min(totalVerts, Math.max(2, Math.round(targetCount)));
   if (n < 2) return;
-
-  const home = new Float32Array(n * 3);
-  const text = new Float32Array(n * 3);
-  const color = new Float32Array(n * 3);
-  const radial = new Float32Array(n * 3);
-  const randDir = new Float32Array(n * 3);
-  const rand = new Float32Array(n);
-  const size = new Float32Array(n);
-
-  for (let i = 0; i < n; i++) {
-    const s = i * stride;
-    const s3 = s * 3;
-    const i3 = i * 3;
-    home[i3] = full.home[s3];
-    home[i3 + 1] = full.home[s3 + 1];
-    home[i3 + 2] = full.home[s3 + 2];
-    text[i3] = full.text[s3];
-    text[i3 + 1] = full.text[s3 + 1];
-    text[i3 + 2] = full.text[s3 + 2];
-    color[i3] = full.color[s3];
-    color[i3 + 1] = full.color[s3 + 1];
-    color[i3 + 2] = full.color[s3 + 2];
-    radial[i3] = full.radial[s3];
-    radial[i3 + 1] = full.radial[s3 + 1];
-    radial[i3 + 2] = full.radial[s3 + 2];
-    randDir[i3] = full.randDir[s3];
-    randDir[i3 + 1] = full.randDir[s3 + 1];
-    randDir[i3 + 2] = full.randDir[s3 + 2];
-    rand[i] = full.rand[s];
-    size[i] = full.size[s];
-  }
-
-  particleGeo.setAttribute('position', new THREE.BufferAttribute(home, 3));
-  particleGeo.setAttribute('aHome', new THREE.BufferAttribute(home, 3));
-  particleGeo.setAttribute('aText', new THREE.BufferAttribute(text, 3));
-  particleGeo.setAttribute('aColor', new THREE.BufferAttribute(color, 3));
-  particleGeo.setAttribute('aRadial', new THREE.BufferAttribute(radial, 3));
-  particleGeo.setAttribute('aRandDir', new THREE.BufferAttribute(randDir, 3));
-  particleGeo.setAttribute('aRand', new THREE.BufferAttribute(rand, 1));
-  particleGeo.setAttribute('aSize', new THREE.BufferAttribute(size, 1));
+  particleGeo.setDrawRange(0, n);
 
   activeParticles = n;
   $('statCount').textContent = `粒子 ${n.toLocaleString()}`;
@@ -625,8 +706,9 @@ const actions = {
           });
         });
       } else {
-        // 已经在字母形状：散开再聚合，重新拼一遍
+        // 已经或接近字母形状：补全 morph，再散开重聚。
         tween(state, 'spread', 1, 1.0, EASE.inOutSine, () => {
+          tween(state, 'morph', 1, 0.8, EASE.inOutCubic);
           tween(state, 'spread', 0, 1.8, EASE.inOutCubic);
         });
       }
@@ -641,6 +723,7 @@ const actions = {
   explode() {
     clearPending();
     state.spreadMode = 0;
+    tween(state, 'morph', 0, 1.1);
     if (state.particleOpacity < 0.98 || state.meshOpacity > 0.02) {
       ensureParticlesVisible(true);
       actionTimeout = setTimeout(() => {
@@ -666,6 +749,7 @@ const actions = {
     clearPending();
     ensureParticlesVisible(true);
     tween(state, 'spread', 0, 2.2, EASE.inOutCubic);
+    tween(state, 'morph', 0, 2.2, EASE.inOutCubic);
   },
 };
 
@@ -705,6 +789,10 @@ function cycleStep(i) {
 function updateFrame(dt, elapsed) {
   updateTweens(dt);
 
+  controls.autoRotate = $('autoRotate').checked;
+  controls.update();
+  camera.updateMatrixWorld();
+
   const u = particleMaterial.uniforms;
   u.uTime.value = elapsed;
   u.uSpread.value = state.spread;
@@ -714,6 +802,9 @@ function updateFrame(dt, elapsed) {
   u.uMorph.value = state.morph;
   u.uParticleOpacity.value = state.particleOpacity;
   u.uSizeScale.value = parseFloat($('particleSize').value);
+  u.uCameraRight.value.setFromMatrixColumn(camera.matrixWorld, 0);
+  u.uCameraUp.value.setFromMatrixColumn(camera.matrixWorld, 1);
+  u.uCameraBack.value.setFromMatrixColumn(camera.matrixWorld, 2);
 
   if (particleSystem) particleSystem.visible = state.particleOpacity > 0.004;
   if (modelRoot) modelRoot.visible = state.meshOpacity > 0.004;
@@ -724,10 +815,10 @@ function updateFrame(dt, elapsed) {
     const base = m.userData.baseOpacity;
     const offset = m.userData.dissolveOffset;
     m.opacity = base * clamp01(state.meshOpacity * 1.35 - offset);
+    // 半透明模型不再写入深度，避免在交叉淡入时遮住内部粒子。
+    m.depthWrite = state.meshOpacity > 0.98;
   }
 
-  controls.autoRotate = $('autoRotate').checked;
-  controls.update();
   composer.render();
 }
 
@@ -885,7 +976,7 @@ function animate(now) {
 window.addEventListener('resize', resize);
 resize();
 init();
-animate(0);
+requestAnimationFrame(animate);
 
 /* 调试钩子（便于自动化验证） */
 window.__app = {
