@@ -829,9 +829,15 @@ function updateFrame(dt, elapsed) {
 let activeButton = null;
 
 function setActiveButton(action) {
-  if (activeButton) activeButton.classList.remove('active');
+  if (activeButton) {
+    activeButton.classList.remove('active');
+    activeButton.setAttribute('aria-pressed', 'false');
+  }
   activeButton = document.querySelector(`.ctrl-btn[data-action="${action}"]`);
-  if (activeButton) activeButton.classList.add('active');
+  if (activeButton) {
+    activeButton.classList.add('active');
+    activeButton.setAttribute('aria-pressed', 'true');
+  }
   updateSlider();
 }
 
